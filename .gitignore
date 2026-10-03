@@ -1,0 +1,10 @@
+.venv/*
+alcove-island/*
+all_in_one.sh
+project_context.txt
+use.py
+use.sh
+logs/*
+modules/__pycache__/*
+core/__pycache__/*
+ipc/__pycache__/*
