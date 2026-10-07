@@ -52,6 +52,9 @@ class IpcDispatcher:
                 if self.backend.mpris: await self.backend.mpris.control("Next")
             elif action == "MEDIA_PREV":
                 if self.backend.mpris: await self.backend.mpris.control("Previous")
+            # 🚀 核心修复：正确挂载 MEDIA_FOCUS 处理逻辑
+            elif action == "MEDIA_FOCUS":
+                if self.backend.mpris: await self.backend.mpris.raise_player()
             
             # 2. 音量与亮度
             elif action == "VOLUME_DELTA":
@@ -90,7 +93,7 @@ class IpcDispatcher:
             elif action == "TEAMS_FOCUS":
                 if self.backend.notifications: await self.backend.notifications.focus_teams()
 
-            # 6. 系统电源与会话控制 (新增)
+            # 6. 系统电源与会话控制
             elif action == "POWER_SUSPEND":
                 if self.backend.power: await self.backend.power.suspend()
             elif action == "POWER_REBOOT":

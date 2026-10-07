@@ -83,7 +83,7 @@ class DynamicIslandBackend:
         await self.power.init()
 
         # 8. 启动 WebSocket IPC 服务器
-        await self.dispatcher.start_server(host="127.0.0.1", port=8765)
+        await self.dispatcher.start_server()
 
     async def shutdown(self):
         """优雅清理资源"""
@@ -93,4 +93,7 @@ class DynamicIslandBackend:
         if self.notifications:
             await self.notifications.close()
         if self.mpris:
-            await self.mpris.close()    
+            await self.mpris.close()
+        # 🚀 清理 UDS 服务及文件
+        if self.dispatcher:
+            await self.dispatcher.close()

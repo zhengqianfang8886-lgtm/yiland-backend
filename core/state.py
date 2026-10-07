@@ -18,10 +18,14 @@ class IslandState:
         self.position: float = 0.0
         self.duration: float = 0.0
 
-        # 音量与亮度
+        # 音量与亮度（硬锁定 0~100）
         self.volume: int = 50
         self.is_muted: bool = False
         self.brightness: int = 100
+
+        # 🚀 补全：系统麦克风通道状态
+        self.mic_volume: int = 80
+        self.is_mic_muted: bool = False
 
         # 蓝牙模块
         self.bt_powered: bool = True
@@ -67,9 +71,12 @@ class IslandState:
                     "progress": progress
                 },
                 "system": {
-                    "volume": self.volume,
+                    "volume": min(100, max(0, self.volume)),
                     "muted": self.is_muted,
-                    "brightness": self.brightness,
+                    "brightness": min(100, max(5, self.brightness)),
+                    # 🚀 同步麦克风状态给灵动岛前端
+                    "mic_volume": min(100, max(0, self.mic_volume)),
+                    "mic_muted": self.is_mic_muted
                 },
                 "bluetooth": {
                     "powered": self.bt_powered,

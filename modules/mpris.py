@@ -1,3 +1,6 @@
+import os
+import re
+import shutil
 import asyncio
 import urllib.parse
 from typing import Dict, Any, Optional, List
@@ -8,7 +11,7 @@ from core.state import IslandState
 from ipc.dispatcher import IpcDispatcher
 
 class MprisModule:
-    """极速响应版 MPRIS 媒体监听（去阻塞、零延时封面同步）"""
+    """极速响应版 MPRIS 媒体监听（去阻塞、零延时封面同步、原生穿透置顶）"""
 
     def __init__(self, bus: MessageBus, state: IslandState, dispatcher: IpcDispatcher):
         self.bus = bus
@@ -118,8 +121,6 @@ class MprisModule:
                 self.state.title, self.state.artist, self.state.playback_status, self.state.duration, self.state.art_url
             )
             self.dispatcher.broadcast("MEDIA_UPDATE")
-
-            # 进度拉取异步放在后台，不阻塞媒体元数据广播
             self.state.position = await self._fetch_position()
         except Exception as e:
             self.log.error(f"绑定播放器 {bus_name} 异常: {e}")
@@ -129,7 +130,6 @@ class MprisModule:
         artists = meta.get("xesam:artist", ["未知艺术家"])
         self.state.artist = ", ".join(artists) if isinstance(artists, list) else str(artists)
         
-        # 极速提取封面 URL
         art_url = meta.get("mpris:artUrl", "") or meta.get("xesam:url", "")
         if art_url:
             art_url = str(art_url)
@@ -172,9 +172,7 @@ class MprisModule:
                         self.state.playback_status = new_status
 
                     if "Metadata" in unwrapped:
-                        # 🚀 核心修复：直接解析新元数据，绝不提前置空 art_url 引起前端闪烁
                         self._parse_metadata(unwrapped["Metadata"])
-                        # 切歌时瞬时进度归零，绝不等待阻塞的 D-Bus 查询
                         self.state.position = 0.0
 
                     curr_state = (
@@ -187,7 +185,6 @@ class MprisModule:
 
                     if curr_state != self._last_emitted_state:
                         self._last_emitted_state = curr_state
-                        # 🚀 立即广播，毫秒级推给灵动岛
                         self.dispatcher.broadcast("MEDIA_UPDATE")
 
         for rule in [mpris_rule, name_rule]:
@@ -227,3 +224,123 @@ class MprisModule:
             )
         except Exception as e:
             self.log.error(f"执行媒体指令失败: {e}")
+
+    # =========================================================================
+    # 🚀 核心重构：真正可用的 PID + 标题双重精准唤醒置顶
+    # =========================================================================
+    async def _get_player_pid(self, bus_name: str) -> Optional[int]:
+        # 1. 尝试从 bus 名称中直接提取 instance<PID>
+        if m := re.search(r"instance(\d+)", bus_name):
+            return int(m.group(1))
+
+        # 2. 通过 D-Bus 获取 Unix 进程 PID
+        try:
+            reply = await self.bus.call(
+                Message(
+                    destination="org.freedesktop.DBus",
+                    path="/org/freedesktop/DBus",
+                    interface="org.freedesktop.DBus",
+                    member="GetConnectionUnixProcessID",
+                    signature="s",
+                    body=[bus_name]
+                )
+            )
+            if reply.message_type != MessageType.ERROR and reply.body:
+                return int(reply.body[0])
+        except Exception:
+            pass
+        return None
+
+    async def raise_player(self) -> bool:
+        """真正强制唤醒置顶当前正在播放的音乐窗口"""
+        target_bus = self.state.active_player
+        if not target_bus:
+            players = await self.discover_players()
+            target_bus = self.state.active_player if players else None
+
+        if not target_bus:
+            self.log.warning("未检测到活跃的媒体播放器，无法执行聚焦")
+            return False
+
+        self.log.info(f"🎯 尝试激活播放器: {target_bus}")
+
+        # 步骤 1: 礼貌性发送 MPRIS Raise（Chromium 会忽略此协议，但原生播放器有效）
+        try:
+            await self.bus.call(
+                Message(
+                    destination=target_bus,
+                    path="/org/mpris/MediaPlayer2",
+                    interface="org.mpris.MediaPlayer2",
+                    member="Raise"
+                )
+            )
+        except Exception:
+            pass
+
+        # 步骤 2: 获取底层真实 PID，通过合成器强制对焦
+        pid = await self._get_player_pid(target_bus)
+        self.log.info(f"🔍 解析到播放器宿主 PID: {pid}")
+
+        # 方案 A: 针对 Hyprland 合成器
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            if pid:
+                cmd = f"hyprctl dispatch focuswindow pid:{pid}"
+                proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                await proc.communicate()
+                if proc.returncode == 0:
+                    self.log.success(f"已通过 Hyprland 按 PID {pid} 置顶窗口")
+                    return True
+
+            # 若 PID 属于子进程，按当前曲名精准置顶
+            if self.state.title and self.state.title != "等待播放媒体...":
+                clean_title = re.escape(self.state.title.split(" - ")[0].strip()[:10])
+                cmd = f"hyprctl dispatch focuswindow 'title:^(.*{clean_title}.*)$'"
+                proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                await proc.communicate()
+                if proc.returncode == 0:
+                    self.log.success(f"已通过 Hyprland 按曲名 [{clean_title}] 置顶窗口")
+                    return True
+
+        # 方案 B: 针对 Sway 合成器
+        if os.environ.get("SWAYSOCK"):
+            if pid:
+                cmd = f"swaymsg '[pid={pid}] focus'"
+                proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await proc.communicate()
+                if proc.returncode == 0:
+                    self.log.success(f"已通过 Sway 按 PID {pid} 置顶窗口")
+                    return True
+
+        # 方案 C: 针对 X11 / XWayland 环境
+        if pid and shutil.which("xdotool"):
+            cmd = f"WID=$(xdotool search --pid {pid} 2>/dev/null | tail -n 1); [ -n \"$WID\" ] && xdotool windowactivate --sync \"$WID\""
+            proc = await asyncio.create_subprocess_shell(cmd)
+            await proc.communicate()
+            if proc.returncode == 0:
+                self.log.success(f"已通过 xdotool 按 PID {pid} 置顶窗口")
+                return True
+
+        if pid and shutil.which("wmctrl"):
+            # 扫描 wmctrl -lp 中的对应 PID
+            proc = await asyncio.create_subprocess_exec("wmctrl", "-lp", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            for line in out.decode(errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == str(pid):
+                    wid = parts[0]
+                    await asyncio.create_subprocess_exec("wmctrl", "-i", "-a", wid)
+                    self.log.success(f"已通过 wmctrl -i -a {wid} 置顶窗口")
+                    return True
+
+        # 方案 D: 曲名兜底激活
+        if self.state.title and self.state.title != "等待播放媒体...":
+            clean_title = self.state.title.split(" - ")[0].strip()
+            if shutil.which("wmctrl"):
+                proc = await asyncio.create_subprocess_shell(f'wmctrl -a "{clean_title}"')
+                await proc.communicate()
+                if proc.returncode == 0:
+                    self.log.success(f"已通过 wmctrl 曲名置顶窗口: {clean_title}")
+                    return True
+
+        self.log.warning("未能置顶音乐窗口（请确认播放器未被最小化至后台托盘）")
+        return False
