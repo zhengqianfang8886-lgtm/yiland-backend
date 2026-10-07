@@ -1,3 +1,7 @@
+# ==========================================
+# 📄 File: main.py
+# 🌟 全功能测试终端（包含电源、电量、蓝牙连断测试命令）
+# ==========================================
 import os
 import sys
 import json
@@ -6,9 +10,11 @@ from loguru import logger
 from core.logger import setup_logging
 from core.backend import DynamicIslandBackend
 
+
 def format_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
+
 
 async def terminal_cli(backend: DynamicIslandBackend):
     print("\n" + "="*70)
@@ -20,10 +26,12 @@ async def terminal_cli(backend: DynamicIslandBackend):
     print("    prev         : 上一首 (Previous)")
     print("    media        : 打印当前音轨详情与秒级进度")
     print("    r            : 重新扫描并连接 MPRIS 播放器")
+    print("    focus        : 唤醒并置顶当前正在播放的音乐窗口")
     print("  [音量与亮度]")
     print("    v+ / v-      : 音量增减 5%")
-    print("    vol <0-150>  : 设置绝对音量 (例: vol 80)")
-    print("    m            : 切换静音状态")
+    print("    vol <0-100>  : 设置绝对音量 (例: vol 80)")
+    print("    m            : 切换扬声器静音")
+    print("    mic-m        : 切换麦克风静音")
     print("    b+ / b-      : 亮度增减 10%")
     print("    bri <1-100>  : 设置绝对亮度 (例: bri 70)")
     print("  [虚拟桌面]")
@@ -33,7 +41,12 @@ async def terminal_cli(backend: DynamicIslandBackend):
     print("  [蓝牙 & 网络/VPN]")
     print("    bt           : 查看所有已配对/已连接蓝牙设备及电量")
     print("    bt-power     : 开关蓝牙适配器电源")
+    print("    bt-con <MAC> : 连接指定 MAC 蓝牙设备")
+    print("    bt-dis <MAC> : 断开指定 MAC 蓝牙设备")
     print("    net          : 查看当前网络类型、WiFi强度、VPN及吞吐速率")
+    print("  [电池与电源模式]")
+    print("    bat          : 查看 UPower 电池电量、充电状态与电源模式")
+    print("    eco          : 切换节能 / 平衡电源配置文件")
     print("  [Teams 消息 & 通话交互]")
     print("    teams        : 查看最新一条 Microsoft Teams 消息/来电信息")
     print("    call         : [测试] 模拟收到 Teams 来电呼叫")
@@ -68,7 +81,7 @@ async def terminal_cli(backend: DynamicIslandBackend):
             cmd = parts[0].lower()
             args = parts[1:]
 
-            # 1. 媒体测试
+            # 1. 媒体
             if cmd in ('p', 'pause'):
                 if backend.mpris: await backend.mpris.control("PlayPause")
             elif cmd in ('n', 'next'):
@@ -86,6 +99,8 @@ async def terminal_cli(backend: DynamicIslandBackend):
                 print(f"🎮 播放源   : {s.active_player or '无活动播放器'}")
             elif cmd == 'r':
                 if backend.mpris: await backend.mpris.discover_players()
+            elif cmd == 'focus':
+                if backend.mpris: await backend.mpris.raise_player()
 
             # 2. 音量与亮度
             elif cmd == 'v+':
@@ -97,9 +112,11 @@ async def terminal_cli(backend: DynamicIslandBackend):
                     val = int(args[0])
                     if backend.audio: await backend.audio.set_volume(val)
                 except ValueError:
-                    print("⚠️ 请输入正确的音量数值 (0-150)。")
+                    print("⚠️ 请输入正确的音量数值 (0-100)。")
             elif cmd == 'm':
                 if backend.audio: await backend.audio.toggle_mute()
+            elif cmd == 'mic-m':
+                if backend.audio: await backend.audio.toggle_mic_mute()
             elif cmd == 'b+':
                 if backend.brightness: await backend.brightness.set_delta(10)
             elif cmd == 'b-':
@@ -111,7 +128,7 @@ async def terminal_cli(backend: DynamicIslandBackend):
                 except ValueError:
                     print("⚠️ 请输入正确的亮度百分比 (1-100)。")
 
-            # 3. 虚拟桌面测试
+            # 3. 虚拟桌面
             elif cmd == 'ws' and not args:
                 s = backend.state
                 print(f"🖥️ 当前工作区: [{s.workspace_index}/{s.workspace_total}] '{s.workspace_name}'")
@@ -141,6 +158,10 @@ async def terminal_cli(backend: DynamicIslandBackend):
                     print(f"  - [{st}] {d['name']} (MAC: {d['mac']}{bat})")
             elif cmd == 'bt-power':
                 if backend.bluetooth: await backend.bluetooth.toggle_power()
+            elif cmd == 'bt-con' and args:
+                if backend.bluetooth: await backend.bluetooth.connect_device(args[0])
+            elif cmd == 'bt-dis' and args:
+                if backend.bluetooth: await backend.bluetooth.disconnect_device(args[0])
             elif cmd == 'net':
                 s = backend.state
                 print(f"🌐 网络状态: 连通={s.net_connected}, 模式={s.net_type}, 名称='{s.net_name}', 信号={s.net_strength}%")
@@ -148,7 +169,15 @@ async def terminal_cli(backend: DynamicIslandBackend):
                 print(f"🔒 VPN 状态: {vpn_str}")
                 print(f"⚡ 实时速率: ↓ {s.net_rx_speed}  |  ↑ {s.net_tx_speed}")
 
-            # 5. Teams 与通话控制
+            # 5. 电池与电源配置
+            elif cmd == 'bat':
+                s = backend.state
+                chg_str = "⚡ 正在充电" if s.battery_charging else "🔋 电池供电"
+                print(f"🔋 电池电量: {s.battery_pct}% ({chg_str}) | 电源策略: {s.power_profile}")
+            elif cmd == 'eco':
+                if backend.power: await backend.power.toggle_power_save_mode()
+
+            # 6. Teams
             elif cmd == 'teams':
                 s = backend.state
                 status = " [📞 正在响铃呼叫]" if backend.notifications and backend.notifications.is_calling else ""
@@ -190,7 +219,7 @@ async def terminal_cli(backend: DynamicIslandBackend):
                     backend.dispatcher.broadcast("TEAMS_NOTIFICATION")
                     print("💬 [测试] 已触发模拟 Teams 消息推送。")
 
-            # 6. 电源与会话管理 (对应图片 6 项)
+            # 7. 电源操作
             elif cmd in ('suspend', 'sleep'):
                 if backend.power: await backend.power.suspend()
             elif cmd in ('reboot', 'rb'):
@@ -204,7 +233,7 @@ async def terminal_cli(backend: DynamicIslandBackend):
             elif cmd in ('switch', 'switch-user', 'su'):
                 if backend.power: await backend.power.switch_user()
 
-            # 7. 系统管理
+            # 8. 调试与退出
             elif cmd == 'dump':
                 print(json.dumps(backend.state.to_json("DEBUG_DUMP"), indent=2, ensure_ascii=False))
             elif cmd in ('help', '?'):
@@ -218,12 +247,13 @@ async def terminal_cli(backend: DynamicIslandBackend):
         except Exception as e:
             logger.error(f"CLI 处理异常: {e}")
 
+
 async def main():
     setup_logging(level="INFO")
-
     backend = DynamicIslandBackend()
     await backend.initialize()
     await terminal_cli(backend)
+
 
 if __name__ == "__main__":
     try:

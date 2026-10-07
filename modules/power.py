@@ -1,3 +1,7 @@
+# ==========================================
+# 📄 File: modules/power.py
+# 🌟 完善版电源模块（UPower 充电脉冲、节能模式切换与会话调度）
+# ==========================================
 import os
 import shutil
 import asyncio
@@ -8,13 +12,8 @@ from dbus_next import Message, MessageType, Variant
 from core.state import IslandState
 from ipc.dispatcher import IpcDispatcher
 
-class PowerModule:
-    """
-    系统级电源与会话管理模块：
-    全面适配 SDDM、GDM、LightDM、KDE Plasma 5/6、Hyprland 等环境。
-    涵盖：睡眠、重启、关机、锁屏、注销会话、切换用户。
-    """
 
+class PowerModule:
     def __init__(self, session_bus: Optional[MessageBus], system_bus: Optional[MessageBus], state: IslandState, dispatcher: IpcDispatcher):
         self.session_bus = session_bus
         self.system_bus = system_bus
@@ -23,10 +22,12 @@ class PowerModule:
         self.log = logger.bind(module="POWER")
 
     async def init(self):
-        self.log.success("电源与会话管理模块已就绪。")
+        if self.system_bus:
+            await self._setup_upower_listener()
+            await self._sync_power_profile()
+        self.log.success("电源与会话管理模块已就绪（UPower 零轮询电池感知已挂载）。")
 
     async def _safe_exec(self, cmd_str: str) -> bool:
-        """执行底层外部命令并记录明确的日志"""
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd_str,
@@ -39,14 +40,142 @@ class PowerModule:
                 return True
             else:
                 err_msg = stderr.decode(errors="ignore").strip() or stdout.decode(errors="ignore").strip()
-                self.log.debug(f"命令执行未成功 [{proc.returncode}]: {cmd_str} -> {err_msg}")
+                self.log.debug(f"命令未成功 [{proc.returncode}]: {cmd_str} -> {err_msg}")
                 return False
         except Exception as e:
             self.log.error(f"执行异常: {cmd_str} -> {e}")
             return False
 
     # =========================================================================
-    # 1. 睡眠 (SUSPEND - 深度低功耗待机)
+    # 🔋 原生 UPower 零轮询电池与插拔脉冲感知
+    # =========================================================================
+    async def _setup_upower_listener(self):
+        try:
+            reply = await self.system_bus.call(
+                Message(
+                    destination="org.freedesktop.UPower",
+                    path="/org/freedesktop/UPower",
+                    interface="org.freedesktop.UPower",
+                    member="GetDisplayDevice"
+                )
+            )
+            if reply.message_type == MessageType.ERROR:
+                return
+
+            device_path = reply.body[0]
+
+            async def _read_props():
+                prop_reply = await self.system_bus.call(
+                    Message(
+                        destination="org.freedesktop.UPower",
+                        path=device_path,
+                        interface="org.freedesktop.DBus.Properties",
+                        member="GetAll",
+                        signature="s",
+                        body=["org.freedesktop.UPower.Device"]
+                    )
+                )
+                if prop_reply.message_type != MessageType.ERROR:
+                    props = prop_reply.body[0]
+                    # State: 1=Charging, 2=Discharging, 4=Fully Charged
+                    state_code = props.get("State", Variant("u", 0)).value
+                    pct = int(round(props.get("Percentage", Variant("d", 100.0)).value))
+                    is_charging = (state_code in (1, 4))
+
+                    old_charging = self.state.battery_charging
+                    self.state.battery_pct = pct
+                    self.state.battery_charging = is_charging
+
+                    # 🚀 检测插拔脉冲事件
+                    if not old_charging and is_charging:
+                        self.log.success(f"⚡ 电源线已接入 · 正在充电 (当前电量 {pct}%)")
+                        self.dispatcher.broadcast("BATTERY_CHARGING_START")
+                    elif old_charging and not is_charging:
+                        self.log.warning(f"🔋 电源线已断开 · 电池供电模式 (当前电量 {pct}%)")
+                        self.dispatcher.broadcast("BATTERY_DISCHARGING_START")
+                    else:
+                        self.dispatcher.broadcast("BATTERY_UPDATE")
+
+            await _read_props()
+
+            rule = f"type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='{device_path}'"
+            await self.system_bus.call(
+                Message(
+                    destination="org.freedesktop.DBus",
+                    path="/org/freedesktop/DBus",
+                    interface="org.freedesktop.DBus",
+                    member="AddMatch",
+                    signature="s",
+                    body=[rule]
+                )
+            )
+
+            def _on_props_changed(msg: Message):
+                if msg.path == device_path and msg.member == "PropertiesChanged":
+                    asyncio.create_task(_read_props())
+
+            self.system_bus.add_message_handler(_on_props_changed)
+            self.log.success(f"🔋 成功接入 UPower 监听: 初始电量 {self.state.battery_pct}% (充电: {self.state.battery_charging})")
+
+        except Exception as e:
+            self.log.debug(f"UPower 挂载失败: {e}")
+
+    # =========================================================================
+    # 🍃 电源模式切换
+    # =========================================================================
+    async def _sync_power_profile(self):
+        try:
+            if shutil.which("powerprofilesctl"):
+                proc = await asyncio.create_subprocess_exec("powerprofilesctl", "get", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await proc.communicate()
+                self.state.power_profile = out.decode().strip() or "balanced"
+        except Exception:
+            pass
+
+    async def toggle_power_save_mode(self) -> bool:
+        target = "balanced" if self.state.power_profile == "power-saver" else "power-saver"
+        self.log.info(f"🍃 请求切换电源配置 -> {target}")
+
+        if shutil.which("powerprofilesctl"):
+            if await self._safe_exec(f"powerprofilesctl set {target}"):
+                self.state.power_profile = target
+                self.dispatcher.broadcast("POWER_PROFILE_UPDATE")
+                return True
+
+        if shutil.which("tlp"):
+            cmd = "tlp bat" if target == "power-saver" else "tlp ac"
+            if await self._safe_exec(cmd):
+                self.state.power_profile = target
+                self.dispatcher.broadcast("POWER_PROFILE_UPDATE")
+                return True
+
+        return False
+
+    async def open_power_settings(self):
+        settings_cmds = [
+            "gnome-control-center power",
+            "plasma-open-settings powerdevilprofilesconfig",
+            "xfce4-power-manager-settings",
+            "mate-power-preferences"
+        ]
+        for cmd in settings_cmds:
+            bin_name = cmd.split()[0]
+            if shutil.which(bin_name):
+                await self._safe_exec(f"{cmd} &")
+                return
+
+    async def open_system_monitor(self):
+        mon_cmds = [
+            "mission-center", "resources", "gnome-system-monitor",
+            "plasma-systemmonitor", "mate-system-monitor", "xfce4-taskmanager"
+        ]
+        for cmd in mon_cmds:
+            if shutil.which(cmd):
+                await self._safe_exec(f"{cmd} &")
+                return
+
+    # =========================================================================
+    # 会话控制
     # =========================================================================
     async def suspend(self) -> bool:
         self.log.warning("💤 触发系统操作: [睡眠 / Suspend]")
@@ -63,16 +192,11 @@ class PowerModule:
                     )
                 )
                 if reply.message_type != MessageType.ERROR:
-                    self.log.success("已通过 systemd-logind 触发睡眠。")
                     return True
-            except Exception as e:
-                self.log.debug(f"D-Bus 睡眠调用异常: {e}")
-
+            except Exception:
+                pass
         return await self._safe_exec("systemctl suspend || loginctl suspend")
 
-    # =========================================================================
-    # 2. 重启 (REBOOT - 重新引导系统)
-    # =========================================================================
     async def reboot(self) -> bool:
         self.log.warning("🔄 触发系统操作: [重启 / Reboot]")
         if self.system_bus:
@@ -88,16 +212,11 @@ class PowerModule:
                     )
                 )
                 if reply.message_type != MessageType.ERROR:
-                    self.log.success("已通过 systemd-logind 触发重启。")
                     return True
-            except Exception as e:
-                self.log.debug(f"D-Bus 重启调用异常: {e}")
-
+            except Exception:
+                pass
         return await self._safe_exec("systemctl reboot || reboot")
 
-    # =========================================================================
-    # 3. 关机 (POWER OFF - 安全切断电源)
-    # =========================================================================
     async def power_off(self) -> bool:
         self.log.warning("⏻ 触发系统操作: [关机 / Power Off]")
         if self.system_bus:
@@ -113,19 +232,13 @@ class PowerModule:
                     )
                 )
                 if reply.message_type != MessageType.ERROR:
-                    self.log.success("已通过 systemd-logind 触发关机。")
                     return True
-            except Exception as e:
-                self.log.debug(f"D-Bus 关机调用异常: {e}")
-
+            except Exception:
+                pass
         return await self._safe_exec("systemctl poweroff || poweroff")
 
-    # =========================================================================
-    # 4. 锁定屏幕 (LOCK - 快捷键 Win+L)
-    # =========================================================================
     async def lock_screen(self) -> bool:
         self.log.info("🔒 触发系统操作: [锁定屏幕 / Lock]")
-        # 1. 优先使用标准命令行工具进行锁屏
         lock_cmds = [
             "loginctl lock-session",
             "qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock",
@@ -140,55 +253,10 @@ class PowerModule:
             if shutil.which(bin_name):
                 if await self._safe_exec(cmd):
                     return True
-
-        # 2. Session D-Bus 兜底
-        if self.session_bus:
-            try:
-                reply = await self.session_bus.call(
-                    Message(
-                        destination="org.freedesktop.ScreenSaver",
-                        path="/ScreenSaver",
-                        interface="org.freedesktop.ScreenSaver",
-                        member="Lock"
-                    )
-                )
-                if reply.message_type != MessageType.ERROR:
-                    self.log.success("已通过 Session D-Bus ScreenSaver.Lock 锁定。")
-                    return True
-            except Exception as e:
-                self.log.debug(f"ScreenSaver.Lock 异常: {e}")
-
         return False
 
-    # =========================================================================
-    # 5. 注销会话 (LOGOUT - 退出当前账户)
-    # =========================================================================
     async def logout(self) -> bool:
         self.log.warning("🚪 触发系统操作: [注销会话 / Logout]")
-        # 1. KDE Session D-Bus
-        if self.session_bus:
-            for srv, path, iface in [
-                ("org.kde.Shutdown", "/Shutdown", "org.kde.Shutdown"),
-                ("org.kde.ksmserver", "/KSMServer", "org.kde.KSMServerInterface"),
-            ]:
-                try:
-                    reply = await self.session_bus.call(
-                        Message(
-                            destination=srv,
-                            path=path,
-                            interface=iface,
-                            member="logout",
-                            signature="iii",
-                            body=[0, 0, 0]
-                        )
-                    )
-                    if reply.message_type != MessageType.ERROR:
-                        self.log.success(f"已通过 {srv} 触发注销。")
-                        return True
-                except Exception:
-                    pass
-
-        # 2. 外部指令降级
         session_id = os.environ.get("XDG_SESSION_ID")
         cmd_loginctl = f"loginctl terminate-session {session_id}" if session_id else "loginctl terminate-session ${XDG_SESSION_ID:-self}"
         logout_cmds = [
@@ -202,92 +270,18 @@ class PowerModule:
             if shutil.which(bin_name):
                 if await self._safe_exec(cmd):
                     return True
-
         return False
 
-    # =========================================================================
-    # 6. 切换用户 (SWITCH - 调出登录管理器 Greeter)
-    # =========================================================================
     async def switch_user(self) -> bool:
         self.log.info("👥 触发系统操作: [切换用户 / Switch User]")
-
-        # 【通道 1】System Bus -> DisplayManager.Seat.SwitchToGreeter (SDDM / LightDM 官方正统接口)
-        if self.system_bus:
-            for seat_path in ["/org/freedesktop/DisplayManager/Seat0", "/org/freedesktop/DisplayManager/Seat/0"]:
-                try:
-                    reply = await self.system_bus.call(
-                        Message(
-                            destination="org.freedesktop.DisplayManager",
-                            path=seat_path,
-                            interface="org.freedesktop.DisplayManager.Seat",
-                            member="SwitchToGreeter"
-                        )
-                    )
-                    if reply.message_type != MessageType.ERROR:
-                        self.log.success(f"已通过 DisplayManager ({seat_path}) 调起 Greeter 登录界面。")
-                        return True
-                except Exception as e:
-                    self.log.debug(f"DisplayManager.SwitchToGreeter 调用尝试 [{seat_path}]: {e}")
-
-        # 【通道 2】System Bus -> GDM (GNOME Display Manager 专属通道)
-        if self.system_bus:
-            try:
-                reply = await self.system_bus.call(
-                    Message(
-                        destination="org.gnome.DisplayManager",
-                        path="/org/gnome/DisplayManager/LocalDisplayFactory",
-                        interface="org.gnome.DisplayManager.LocalDisplayFactory",
-                        member="CreateTransientDisplay"
-                    )
-                )
-                if reply.message_type != MessageType.ERROR:
-                    self.log.success("已通过 GDM LocalDisplayFactory 唤出新登录界面。")
-                    return True
-            except Exception as e:
-                self.log.debug(f"GDM CreateTransientDisplay 尝试失败: {e}")
-
-        # 【通道 3】Session Bus -> KDE KRunner switchUser / KSMServer
-        if self.session_bus:
-            try:
-                reply = await self.session_bus.call(
-                    Message(
-                        destination="org.kde.krunner",
-                        path="/App",
-                        interface="org.kde.krunner.App",
-                        member="switchUser"
-                    )
-                )
-                if reply.message_type != MessageType.ERROR:
-                    self.log.success("已通过 KDE KRunner 触发 switchUser。")
-                    return True
-            except Exception as e:
-                self.log.debug(f"KDE krunner switchUser 尝试失败: {e}")
-
-        # 【通道 4】Linux 标准命令行指令阶梯调用
-        # gdbus 是绝大多数 Linux 发行版(包含 Arch/Ubuntu/Fedora/openSUSE)的标配工具
         cli_candidates = [
-            # 1. SDDM / LightDM 标准 gdbus 系统调用
             "gdbus call --system --dest org.freedesktop.DisplayManager --object-path /org/freedesktop/DisplayManager/Seat0 --method org.freedesktop.DisplayManager.Seat.SwitchToGreeter",
-            # 2. GDM gdbus 系统调用
             "gdbus call --system --dest org.gnome.DisplayManager --object-path /org/gnome/DisplayManager/LocalDisplayFactory --method org.gnome.DisplayManager.LocalDisplayFactory.CreateTransientDisplay",
-            # 3. SDDM / LightDM qdbus 调用
-            "qdbus6 --system org.freedesktop.DisplayManager /org/freedesktop/DisplayManager/Seat0 org.freedesktop.DisplayManager.Seat.SwitchToGreeter",
-            "qdbus --system org.freedesktop.DisplayManager /org/freedesktop/DisplayManager/Seat0 org.freedesktop.DisplayManager.Seat.SwitchToGreeter",
-            # 4. KDE KRunner
-            "qdbus6 org.kde.krunner /App switchUser",
-            "qdbus org.kde.krunner /App switchUser",
-            # 5. LightDM dm-tool
-            "dm-tool switch-to-greeter",
-            # 6. GDM flexiserver
-            "gdmflexiserver"
+            "dm-tool switch-to-greeter"
         ]
-
         for cmd in cli_candidates:
             bin_name = cmd.split()[0]
             if shutil.which(bin_name):
                 if await self._safe_exec(cmd):
                     return True
-
-        # 【通道 5】终极兜底：唤出锁屏（锁屏界面上均有用户切换按钮）
-        self.log.warning("所有 Greeter 直切通道均未响应，执行锁屏以供手动切换用户。")
         return await self.lock_screen()

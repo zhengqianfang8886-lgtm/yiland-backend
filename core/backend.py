@@ -1,4 +1,7 @@
-# FILE: core/backend.py
+# ==========================================
+# 📄 File: core/backend.py
+# 🌟 完善版核心微服务挂载中枢（优雅生命周期）
+# ==========================================
 import sys
 from typing import Optional
 from loguru import logger
@@ -15,6 +18,7 @@ from modules.network import NetworkModule
 from modules.notifications import NotificationModule
 from modules.workspace import WorkspaceModule
 from modules.power import PowerModule
+
 
 class DynamicIslandBackend:
     def __init__(self):
@@ -48,7 +52,7 @@ class DynamicIslandBackend:
             self.system_bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             self.log.success("System Bus 连接成功。")
         except Exception as e:
-            self.log.warning(f"无法接入 System Bus (蓝牙/网络部分功能受限): {e}")
+            self.log.warning(f"无法接入 System Bus (蓝牙/网络/UPower 功能受限): {e}")
 
         # 1. 虚拟桌面模块
         self.workspace = WorkspaceModule(self.session_bus, self.state, self.dispatcher)
@@ -58,11 +62,11 @@ class DynamicIslandBackend:
         self.mpris = MprisModule(self.session_bus, self.state, self.dispatcher)
         await self.mpris.init()
 
-        # 3. 屏幕亮度模块 (支持 KDE 与通用 brightnessctl)
+        # 3. 屏幕亮度模块
         self.brightness = BrightnessModule(self.session_bus, self.state, self.dispatcher)
         await self.brightness.init()
 
-        # 4. 音频模块 (PulseAudio / PipeWire, 支持硬件按键极速捕捉与防抖)
+        # 4. 音频模块 (PipeWire / WirePlumber)
         self.audio = AudioModule(self.state, self.dispatcher)
         await self.audio.init()
 
@@ -74,19 +78,19 @@ class DynamicIslandBackend:
             self.network = NetworkModule(self.system_bus, self.state, self.dispatcher)
             await self.network.init()
 
-        # 6. 通知监听与呼叫模块 (通过 BecomeMonitor 旁路嗅探)
+        # 6. 通知监听与呼叫模块
         self.notifications = NotificationModule(self.state, self.dispatcher)
         await self.notifications.init()
 
-        # 7. 电源与会话管理模块 (补全挂载，支持锁屏/休眠/切换用户/重启等)
+        # 7. 电源、节能模式与 UPower 电池感知模块
         self.power = PowerModule(self.session_bus, self.system_bus, self.state, self.dispatcher)
         await self.power.init()
 
-        # 8. 启动 WebSocket IPC 服务器
+        # 8. 启动双模 IPC 服务 (WebSocket + UDS)
         await self.dispatcher.start_server()
 
     async def shutdown(self):
-        """优雅清理资源"""
+        """优雅关闭释放系统资源"""
         self.log.info("正在释放系统资源...")
         if self.audio:
             await self.audio.close()
@@ -94,6 +98,5 @@ class DynamicIslandBackend:
             await self.notifications.close()
         if self.mpris:
             await self.mpris.close()
-        # 🚀 清理 UDS 服务及文件
         if self.dispatcher:
             await self.dispatcher.close()

@@ -1,10 +1,15 @@
+# ==========================================
+# 📄 File: modules/bluetooth.py
+# 🌟 完善版 BlueZ 蓝牙模块（补齐单设备连接与断开原生 D-Bus 控制）
+# ==========================================
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from loguru import logger
 from dbus_next.aio import MessageBus
 from dbus_next import Message, MessageType, Variant
 from core.state import IslandState
 from ipc.dispatcher import IpcDispatcher
+
 
 class BluetoothModule:
     def __init__(self, bus: MessageBus, state: IslandState, dispatcher: IpcDispatcher):
@@ -26,7 +31,12 @@ class BluetoothModule:
     async def init(self):
         try:
             reply = await self.bus.call(
-                Message(destination="org.bluez", path="/", interface="org.freedesktop.DBus.ObjectManager", member="GetManagedObjects")
+                Message(
+                    destination="org.bluez",
+                    path="/",
+                    interface="org.freedesktop.DBus.ObjectManager",
+                    member="GetManagedObjects"
+                )
             )
             if reply.message_type == MessageType.ERROR:
                 self.log.warning("BlueZ 服务未就绪，蓝牙模块已禁用。")
@@ -47,7 +57,7 @@ class BluetoothModule:
                 battery = None
                 if "org.bluez.Battery1" in interfaces:
                     battery = interfaces["org.bluez.Battery1"].get("Percentage", None)
-                
+
                 name = dev.get("Name", dev.get("Alias", "未知设备"))
                 is_connected = dev.get("Connected", False)
                 mac = dev.get("Address", "")
@@ -61,7 +71,8 @@ class BluetoothModule:
                     "icon": dev.get("Icon", "audio-card"),
                     "battery": battery
                 })
-        
+
+        # 已连接设备排在前面
         devices.sort(key=lambda d: not d["connected"])
         self.state.bt_devices = devices
 
@@ -86,7 +97,14 @@ class BluetoothModule:
 
         for rule in [prop_rule, iface_rule]:
             await self.bus.call(
-                Message(destination="org.freedesktop.DBus", path="/org/freedesktop/DBus", interface="org.freedesktop.DBus", member="AddMatch", signature="s", body=[rule])
+                Message(
+                    destination="org.freedesktop.DBus",
+                    path="/org/freedesktop/DBus",
+                    interface="org.freedesktop.DBus",
+                    member="AddMatch",
+                    signature="s",
+                    body=[rule]
+                )
             )
         self.bus.add_message_handler(on_dbus_signal)
 
@@ -99,7 +117,12 @@ class BluetoothModule:
     async def _refresh(self, event_name: str):
         try:
             reply = await self.bus.call(
-                Message(destination="org.bluez", path="/", interface="org.freedesktop.DBus.ObjectManager", member="GetManagedObjects")
+                Message(
+                    destination="org.bluez",
+                    path="/",
+                    interface="org.freedesktop.DBus.ObjectManager",
+                    member="GetManagedObjects"
+                )
             )
             self._sync_all_devices(self._unwrap_variant(reply.body[0]))
             self.dispatcher.broadcast(event_name)
@@ -109,14 +132,84 @@ class BluetoothModule:
     async def toggle_power(self):
         try:
             reply = await self.bus.call(
-                Message(destination="org.bluez", path=self.adapter_path, interface="org.freedesktop.DBus.Properties", member="Get", signature="ss", body=["org.bluez.Adapter1", "Powered"])
+                Message(
+                    destination="org.bluez",
+                    path=self.adapter_path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get",
+                    signature="ss",
+                    body=["org.bluez.Adapter1", "Powered"]
+                )
             )
             new_state = not self._unwrap_variant(reply.body[0])
             await self.bus.call(
-                Message(destination="org.bluez", path=self.adapter_path, interface="org.freedesktop.DBus.Properties", member="Set", signature="ssv", body=["org.bluez.Adapter1", "Powered", Variant("b", new_state)])
+                Message(
+                    destination="org.bluez",
+                    path=self.adapter_path,
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Set",
+                    signature="ssv",
+                    body=["org.bluez.Adapter1", "Powered", Variant("b", new_state)]
+                )
             )
             self.state.bt_powered = new_state
             self.log.success(f"已切换蓝牙适配器电源状态 -> {new_state}")
             self.dispatcher.broadcast("BLUETOOTH_POWER")
         except Exception as e:
             self.log.error(f"切换蓝牙电源状态失败: {e}")
+
+    # =========================================================================
+    # 🚀 补齐：原生 BlueZ D-Bus 设备连接与断开接口
+    # =========================================================================
+    def _mac_to_device_path(self, mac: str) -> str:
+        # BlueZ 对象路径格式: /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX
+        dev_str = "dev_" + mac.replace(":", "_").upper()
+        return f"{self.adapter_path}/{dev_str}"
+
+    async def connect_device(self, mac: str) -> bool:
+        """原生连接指定 MAC 蓝牙设备"""
+        dev_path = self._mac_to_device_path(mac)
+        self.log.info(f"🔗 请求连接蓝牙设备: {mac} (路径: {dev_path})")
+        try:
+            reply = await self.bus.call(
+                Message(
+                    destination="org.bluez",
+                    path=dev_path,
+                    interface="org.bluez.Device1",
+                    member="Connect"
+                )
+            )
+            if reply.message_type != MessageType.ERROR:
+                self.log.success(f"设备 [{mac}] 连接成功。")
+                await self._refresh("BLUETOOTH_CONNECT")
+                return True
+            else:
+                self.log.error(f"设备 [{mac}] 连接失败: {reply.error_name}")
+                return False
+        except Exception as e:
+            self.log.error(f"连接设备异常: {e}")
+            return False
+
+    async def disconnect_device(self, mac: str) -> bool:
+        """原生断开指定 MAC 蓝牙设备"""
+        dev_path = self._mac_to_device_path(mac)
+        self.log.info(f"🔌 请求断开蓝牙设备: {mac} (路径: {dev_path})")
+        try:
+            reply = await self.bus.call(
+                Message(
+                    destination="org.bluez",
+                    path=dev_path,
+                    interface="org.bluez.Device1",
+                    member="Disconnect"
+                )
+            )
+            if reply.message_type != MessageType.ERROR:
+                self.log.success(f"设备 [{mac}] 断开连接成功。")
+                await self._refresh("BLUETOOTH_DISCONNECT")
+                return True
+            else:
+                self.log.error(f"设备 [{mac}] 断开失败: {reply.error_name}")
+                return False
+        except Exception as e:
+            self.log.error(f"断开设备异常: {e}")
+            return False
